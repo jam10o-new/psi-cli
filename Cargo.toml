@@ -1,0 +1,39 @@
+[package]
+name = "psi-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Interactive TUI for filesystem-based workflows and agent orchestration"
+
+[dependencies]
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# TUI framework
+ratatui = { version = "0.29", features = ["crossterm"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Filesystem watching
+notify = "7"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "2"
+futures = "0.3"
+tokio-util = "0.7"
+
+# Text processing
+unicode-segmentation = "1"
+unicode-width = "0.2"
+
+# Path handling
+pathdiff = "0.2"
+glob = "0.3"
+dirs = "5"
