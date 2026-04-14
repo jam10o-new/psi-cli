@@ -49,6 +49,81 @@ const SELECTED_HIGHLIGHT: Style = Style::new()
     .bg(Color::DarkGray)
     .add_modifier(Modifier::BOLD);
 
+/// Compute the display line (row offset from top) and column for a byte offset
+/// in text with word wrapping at the given max inner width.
+fn wrapped_cursor(text: &str, byte_offset: usize, max_inner_width: u16) -> (usize, usize) {
+    if max_inner_width == 0 {
+        return (0, 0);
+    }
+    let max_w = max_inner_width as usize;
+
+    fn char_display_width(c: char) -> usize {
+        unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+    }
+
+    // We walk through the text up to byte_offset, tracking which display
+    // line and column the cursor ends up on.
+    let text_up_to = &text[..byte_offset.min(text.len())];
+
+    let mut display_line = 0usize;
+    let mut current_line_width = 0usize;
+
+    for ch in text_up_to.chars() {
+        if ch == '\n' {
+            // Explicit newline: move to next display line
+            display_line += 1;
+            current_line_width = 0;
+        } else {
+            let w = char_display_width(ch);
+            if current_line_width + w > max_w && current_line_width > 0 {
+                // Wrap to next display line
+                display_line += 1;
+                current_line_width = w;
+            } else {
+                current_line_width += w;
+            }
+        }
+    }
+
+    (display_line, current_line_width)
+}
+
+/// Compute how many display lines the text will occupy when wrapped.
+fn wrapped_line_count(text: &str, max_inner_width: u16) -> usize {
+    if max_inner_width == 0 {
+        return 1;
+    }
+    let max_w = max_inner_width as usize;
+
+    fn char_display_width(c: char) -> usize {
+        unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+    }
+
+    if text.is_empty() {
+        return 1;
+    }
+
+    let mut count = 1usize;
+    let mut current_line_width = 0usize;
+
+    for ch in text.chars() {
+        if ch == '\n' {
+            count += 1;
+            current_line_width = 0;
+        } else {
+            let w = char_display_width(ch);
+            if current_line_width + w > max_w && current_line_width > 0 {
+                count += 1;
+                current_line_width = w;
+            } else {
+                current_line_width += w;
+            }
+        }
+    }
+
+    count.max(1)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMode {
     /// Normal mode: typing messages into the input box
@@ -728,13 +803,20 @@ impl App {
 }
 
 pub fn ui(f: &mut ratatui::Frame, app: &mut App) {
+    let inner_width = f.area().width.saturating_sub(4); // margins + borders
+    let content_lines = wrapped_line_count(&app.input_text, inner_width);
+    // Input area: 4 instruction lines + content lines + separator/border overhead
+    let instruction_count = 4u16;
+    let total_needed = instruction_count + content_lines as u16 + 2;
+    let input_height = total_needed.min(20).max(7);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
         .constraints(
             [
                 Constraint::Min(1),
-                Constraint::Max(3),
+                Constraint::Length(input_height),
             ]
             .as_ref(),
         )
@@ -859,31 +941,82 @@ fn render_chat_log(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
 }
 
 fn render_input(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
-    let input_lines = if app.multiline || app.input_text.contains('\n') {
-        app.input_text.lines().map(|l| Line::from(l.to_string())).collect()
-    } else {
-        vec![Line::from(app.input_text.clone())]
-    };
+    let inner_width = area.width.saturating_sub(2); // 2 for borders
 
+    // Build the instruction lines
     let mode_label = match app.mode {
         AppMode::Select { .. } => "SELECT ",
         _ => "",
     };
+    let instruction_lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{}Input", mode_label),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Tab:select  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Ctrl+F:import  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Ctrl+J:nl", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::styled("Ctrl+Enter:submit  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("↑/↓:scroll  ", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::styled("Ctrl+↑/↓:history  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Ctrl+R:rotate in  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Ctrl+O:rotate out", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+    let instruction_count = instruction_lines.len() as u16;
 
-    let input = Paragraph::new(input_lines)
+    // Split the area: instruction header on top, bordered input box below
+    let input_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(instruction_count),
+            Constraint::Min(3),
+        ])
+        .split(area);
+
+    // Render instruction header (no border, just text)
+    let instructions = Paragraph::new(instruction_lines)
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(instructions, input_chunks[0]);
+
+    // Render the input content with a border
+    let input_text = app.input_text.clone();
+    let input_para = if input_text.is_empty() {
+        Paragraph::new(vec![Line::from(Span::styled(
+            "...",
+            Style::default().fg(Color::DarkGray),
+        ))])
+    } else {
+        Paragraph::new(input_text)
+    };
+
+    let input_box = input_para
+        .style(Style::default().fg(Color::White))
+        .wrap(Wrap { trim: false })
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!("{}Input (Tab: select | Ctrl+F: import | Ctrl+J: nl | Ctrl+Enter: submit | ↑/↓: scroll | Ctrl+↑/↓: history | Ctrl+R: rotate input | Ctrl+O: rotate output)", mode_label)),
-        )
-        .style(Style::default().fg(Color::White));
+                .border_type(ratatui::widgets::BorderType::Rounded),
+        );
 
-    f.render_widget(input, area);
+    f.render_widget(input_box, input_chunks[1]);
 
+    // Calculate cursor position
     if matches!(app.mode, AppMode::Normal) {
-        let cursor_x = area.x + 1 + app.input_cursor as u16;
-        let cursor_y = area.y + 1;
-        f.set_cursor_position((cursor_x.min(area.right() - 2), cursor_y));
+        let (cursor_display_line, cursor_col) = wrapped_cursor(&app.input_text, app.input_cursor, inner_width);
+        let cursor_x = input_chunks[1].x + 1 + cursor_col as u16;
+        let cursor_y = input_chunks[1].y + 1 + cursor_display_line as u16;
+
+        let clamped_x = cursor_x.min(input_chunks[1].right().saturating_sub(1));
+        let clamped_y = cursor_y.min(input_chunks[1].bottom().saturating_sub(1));
+        f.set_cursor_position((clamped_x, clamped_y));
     }
 }
 
