@@ -124,6 +124,109 @@ fn wrapped_line_count(text: &str, max_inner_width: u16) -> usize {
     count.max(1)
 }
 
+/// Build a list of byte offsets where each display line starts.
+/// Returns [0, line2_start_byte, line3_start_byte, ...]
+fn wrapped_line_starts(text: &str, max_inner_width: u16) -> Vec<usize> {
+    if max_inner_width == 0 {
+        return vec![0];
+    }
+    let max_w = max_inner_width as usize;
+
+    fn char_display_width(c: char) -> usize {
+        unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+    }
+
+    let mut starts = vec![0usize];
+    let mut current_line_width = 0usize;
+    let mut byte_offset = 0usize;
+
+    for ch in text.chars() {
+        let ch_len = ch.len_utf8();
+        if ch == '\n' {
+            // Next display line starts after the newline
+            byte_offset += ch_len;
+            starts.push(byte_offset);
+            current_line_width = 0;
+        } else {
+            let w = char_display_width(ch);
+            if current_line_width + w > max_w && current_line_width > 0 {
+                // Wrap: this char starts a new display line
+                starts.push(byte_offset);
+                current_line_width = w;
+                byte_offset += ch_len;
+            } else {
+                current_line_width += w;
+                byte_offset += ch_len;
+            }
+        }
+    }
+
+    if starts.is_empty() {
+        starts.push(0);
+    }
+    starts
+}
+
+/// Move the cursor up or down by one display line in wrapped text.
+/// Returns the new byte offset.
+fn move_cursor_vertical(text: &str, current_offset: usize, max_inner_width: u16, direction: i32) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    let line_starts = wrapped_line_starts(text, max_inner_width);
+
+    // Find which display line the cursor is currently on
+    let mut current_display_line = 0;
+    let mut cursor_col = 0;
+    for (i, &start) in line_starts.iter().enumerate() {
+        let end = if i + 1 < line_starts.len() { line_starts[i + 1] } else { text.len() };
+        if current_offset >= start && current_offset <= end {
+            current_display_line = i;
+            // Calculate column position within this line
+            let prefix = &text[start..current_offset.min(text.len())];
+            let mut w = 0;
+            for c in prefix.chars() {
+                w += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            }
+            cursor_col = w;
+            break;
+        }
+    }
+
+    let target_line = if direction < 0 {
+        current_display_line.saturating_sub(1)
+    } else {
+        (current_display_line + 1).min(line_starts.len() - 1)
+    };
+
+    if target_line == current_display_line {
+        return current_offset; // Already at top/bottom
+    }
+
+    // Place cursor at the same column on the target line
+    let target_start = line_starts[target_line];
+    let target_end = if target_line + 1 < line_starts.len() {
+        line_starts[target_line + 1]
+    } else {
+        text.len()
+    };
+
+    // Walk through target line chars to find position at cursor_col
+    let mut col = 0;
+    let mut byte_pos = target_start;
+    let segment = &text[target_start..target_end];
+    for ch in segment.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if col + w > cursor_col {
+            break;
+        }
+        col += w;
+        byte_pos += ch.len_utf8();
+    }
+
+    byte_pos.min(text.len())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMode {
     /// Normal mode: typing messages into the input box
@@ -158,6 +261,8 @@ pub struct App {
     pub scroll_offset: usize,
     pub scroll_to_bottom: bool,
     pub chat_area_height: u16,
+    /// Cached inner width of the input area (excluding borders), used for wrapped cursor nav
+    pub input_inner_width: u16,
     pub active_input_dir: Option<PathBuf>,
     pub active_output_dir: Option<PathBuf>,
     pub input_dirs: Vec<PathBuf>,
@@ -185,6 +290,7 @@ impl App {
             scroll_offset: 0,
             scroll_to_bottom: false,
             chat_area_height: 0,
+            input_inner_width: 80,
             active_input_dir: None,
             active_output_dir: None,
             input_dirs: Vec::new(),
@@ -428,36 +534,32 @@ impl App {
                 }
             }
             KeyCode::PageUp => {
+                // PageUp: scroll chat up
                 self.scroll_offset = self.scroll_offset.saturating_sub(10);
+                self.scroll_to_bottom = false;
             }
             KeyCode::PageDown => {
+                // PageDown: scroll chat down
                 self.scroll_offset += 10;
+                self.scroll_to_bottom = false;
             }
-            KeyCode::Char('j') | KeyCode::Char('J') => {
-                // vim-style scroll down (only when input box is truly empty)
-                if self.input_text.is_empty() {
-                    self.scroll_offset += 1;
-                } else {
-                    self.input_text.insert(self.input_cursor, 'j');
-                    self.input_cursor += 1;
-                }
+            KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Ctrl+End: scroll to bottom of chat
+                self.scroll_to_bottom = true;
             }
-            KeyCode::Char('k') | KeyCode::Char('K') => {
-                // vim-style scroll up (only when input box is truly empty)
-                if self.input_text.is_empty() {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(1);
-                } else {
-                    self.input_text.insert(self.input_cursor, 'k');
-                    self.input_cursor += 1;
-                }
+            KeyCode::End => {
+                // End: also scrolls to bottom of chat
+                self.scroll_to_bottom = true;
             }
             KeyCode::Up => {
-                // Plain Up: scroll chat up
-                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                // Up: move cursor up one display line in input (across wrapped lines)
+                let w = self.input_inner_width.max(1);
+                self.input_cursor = move_cursor_vertical(&self.input_text, self.input_cursor, w, -1);
             }
             KeyCode::Down => {
-                // Plain Down: scroll chat down
-                self.scroll_offset += 1;
+                // Down: move cursor down one display line in input (across wrapped lines)
+                let w = self.input_inner_width.max(1);
+                self.input_cursor = move_cursor_vertical(&self.input_text, self.input_cursor, w, 1);
             }
             KeyCode::Char(c) => {
                 self.status_message = None;
@@ -805,10 +907,11 @@ impl App {
 pub fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let inner_width = f.area().width.saturating_sub(4); // margins + borders
     let content_lines = wrapped_line_count(&app.input_text, inner_width);
-    // Input area: 4 instruction lines + content lines + separator/border overhead
-    let instruction_count = 4u16;
-    let total_needed = instruction_count + content_lines as u16 + 2;
-    let input_height = total_needed.min(20).max(7);
+    // Input area: 5 instruction lines + optional status line + content lines + borders
+    let instruction_count = 5u16;
+    let status_count = if app.status_message.is_some() { 1 } else { 0 };
+    let total_needed = instruction_count + status_count + content_lines as u16 + 2;
+    let input_height = total_needed.min(20).max(9 + status_count);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -822,8 +925,9 @@ pub fn ui(f: &mut ratatui::Frame, app: &mut App) {
         )
         .split(f.area());
 
-    // Record chat area height for scroll calculations
+    // Record chat area height and input width for scroll/cursor calculations
     app.chat_area_height = chunks[0].height.saturating_sub(2);
+    app.input_inner_width = chunks[1].width.saturating_sub(2).max(1);
 
     // Chat log area
     render_chat_log(f, chunks[0], app);
@@ -907,15 +1011,11 @@ fn render_chat_log(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
 
     // Calculate visible height (subtract borders)
     let visible_height = area.height.saturating_sub(2) as usize;
-
-    // Clamp scroll_offset to actual content bounds
     let max_offset = lines.len().saturating_sub(visible_height);
-    app.scroll_offset = app.scroll_offset.min(max_offset);
 
     // In select mode, auto-scroll to keep cursor visible
     if let AppMode::Select { cursor_index } = app.mode {
-        // Calculate where the cursor is
-        let cursor_line: usize = app.message_line_offsets.iter().take(cursor_index).sum::<usize>() + 2; // +2 for header lines
+        let cursor_line: usize = app.message_line_offsets.iter().take(cursor_index).sum::<usize>() + 2;
         let cursor_bottom = cursor_line + app.message_line_offsets.get(cursor_index).copied().unwrap_or(3);
 
         if cursor_bottom > visible_height + app.scroll_offset {
@@ -926,11 +1026,14 @@ fn render_chat_log(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         }
     }
 
-    // Auto-scroll: if we need to scroll to bottom, compute max offset
+    // Auto-scroll to bottom on new content or explicit request, then clear
+    // the flag so manual scrolling is not immediately overridden.
     let actual_scroll_offset = if app.scroll_to_bottom && !matches!(app.mode, AppMode::Select { .. }) {
+        app.scroll_to_bottom = false;
+        app.scroll_offset = max_offset;
         max_offset
     } else {
-        app.scroll_offset
+        app.scroll_offset.min(max_offset)
     };
 
     let chat = Paragraph::new(lines)
@@ -962,29 +1065,57 @@ fn render_input(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         ]),
         Line::from(vec![
             Span::styled("Ctrl+Enter:submit  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("↑/↓:scroll  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("PgUp/PgDn:scroll", Style::default().fg(Color::DarkGray)),
         ]),
         Line::from(vec![
             Span::styled("Ctrl+↑/↓:history  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("End:scroll bottom", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
             Span::styled("Ctrl+R:rotate in  ", Style::default().fg(Color::DarkGray)),
             Span::styled("Ctrl+O:rotate out", Style::default().fg(Color::DarkGray)),
         ]),
     ];
     let instruction_count = instruction_lines.len() as u16;
 
-    // Split the area: instruction header on top, bordered input box below
+    // Determine status line
+    let status_para = if let Some(ref msg) = app.status_message {
+        Some(Paragraph::new(Line::from(Span::styled(
+            format!(" {}", msg),
+            Style::default().fg(Color::Yellow),
+        ))))
+    } else {
+        None
+    };
+    let status_count = status_para.is_some() as u16;
+
+    // Split the area: instruction header → optional status → bordered input box
     let input_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(instruction_count),
-            Constraint::Min(3),
-        ])
+        .constraints({
+            let mut cs = vec![Constraint::Length(instruction_count)];
+            if status_count > 0 {
+                cs.push(Constraint::Length(1));
+            }
+            cs.push(Constraint::Min(3));
+            cs
+        })
         .split(area);
 
     // Render instruction header (no border, just text)
     let instructions = Paragraph::new(instruction_lines)
         .style(Style::default().fg(Color::DarkGray));
     f.render_widget(instructions, input_chunks[0]);
+
+    // Render status message if present
+    let input_box_idx = if status_count > 0 {
+        if let Some(ref sp) = status_para {
+            f.render_widget(sp.clone(), input_chunks[1]);
+        }
+        2
+    } else {
+        1
+    };
 
     // Render the input content with a border
     let input_text = app.input_text.clone();
@@ -1006,16 +1137,16 @@ fn render_input(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
                 .border_type(ratatui::widgets::BorderType::Rounded),
         );
 
-    f.render_widget(input_box, input_chunks[1]);
+    f.render_widget(input_box, input_chunks[input_box_idx]);
 
     // Calculate cursor position
     if matches!(app.mode, AppMode::Normal) {
         let (cursor_display_line, cursor_col) = wrapped_cursor(&app.input_text, app.input_cursor, inner_width);
-        let cursor_x = input_chunks[1].x + 1 + cursor_col as u16;
-        let cursor_y = input_chunks[1].y + 1 + cursor_display_line as u16;
+        let cursor_x = input_chunks[input_box_idx].x + 1 + cursor_col as u16;
+        let cursor_y = input_chunks[input_box_idx].y + 1 + cursor_display_line as u16;
 
-        let clamped_x = cursor_x.min(input_chunks[1].right().saturating_sub(1));
-        let clamped_y = cursor_y.min(input_chunks[1].bottom().saturating_sub(1));
+        let clamped_x = cursor_x.min(input_chunks[input_box_idx].right().saturating_sub(1));
+        let clamped_y = cursor_y.min(input_chunks[input_box_idx].bottom().saturating_sub(1));
         f.set_cursor_position((clamped_x, clamped_y));
     }
 }
