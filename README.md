@@ -25,7 +25,7 @@ If no input directories are specified, psi-cli defaults to the current working d
 
 ### Agentgraph Integration
 
-psi-cli was designed with [agentgraph](https://github.com/your-org/agentgraph) in mind. The `agent` subcommand sets up the standard directory structure:
+psi-cli was designed with [agentgraph](https://github.com/jam10o-new/agentgraph) in mind. The `agent` subcommand sets up a standard directory structure:
 
 ```bash
 psi-cli agent agents/coder
