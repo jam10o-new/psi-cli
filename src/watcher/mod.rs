@@ -38,13 +38,13 @@ impl FsWatcher {
     pub fn scan_all(&mut self) -> Result<()> {
         let dirs: Vec<PathBuf> = self.watchers.clone();
         for dir in &dirs {
-            self.scan_directory_recursive(dir)?;
+            self.scan_directory(dir)?;
         }
         self.notify()?;
         Ok(())
     }
 
-    fn scan_directory_recursive(&mut self, dir: &PathBuf) -> Result<()> {
+    fn scan_directory(&mut self, dir: &PathBuf) -> Result<()> {
         if !dir.exists() {
             return Ok(());
         }
@@ -55,8 +55,6 @@ impl FsWatcher {
 
             if path.is_file() {
                 self.process_file(path);
-            } else if path.is_dir() {
-                self.scan_directory_recursive(&path)?;
             }
         }
         Ok(())
@@ -123,7 +121,7 @@ impl FsWatcher {
 
         for dir in &self.watchers {
             if dir.exists() {
-                watcher.watch(dir, RecursiveMode::Recursive)?;
+                watcher.watch(dir, RecursiveMode::NonRecursive)?;
             }
         }
 
@@ -173,7 +171,7 @@ impl FsWatcher {
 
         for dir in &self.watchers {
             if dir.exists() {
-                watcher.watch(dir, RecursiveMode::Recursive)?;
+                watcher.watch(dir, RecursiveMode::NonRecursive)?;
             }
         }
 
