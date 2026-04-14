@@ -28,7 +28,16 @@ async fn main() -> Result<()> {
         app_guard.input_dirs = cli.input_dirs.clone();
         app_guard.output_dirs = cli.output_dirs.clone();
         app_guard.system_dirs = cli.system_dirs.clone();
-        app_guard.active_input_dir = cli.input_dirs.first().cloned();
+
+        // If no input dirs provided at startup, default to ./
+        if app_guard.input_dirs.is_empty() {
+            let current_dir = std::env::current_dir().unwrap_or_default();
+            app_guard.input_dirs.push(current_dir.clone());
+            app_guard.active_input_dir = Some(current_dir);
+        } else {
+            app_guard.active_input_dir = cli.input_dirs.first().cloned();
+        }
+
         app_guard.active_output_dir = cli.active_output.or_else(|| {
             cli.output_dirs.first().cloned()
         });
@@ -59,6 +68,7 @@ async fn main() -> Result<()> {
     let app_guard = app.lock().await;
     let input_dirs = app_guard.input_dirs.clone();
     let output_dirs = app_guard.output_dirs.clone();
+    let system_dirs = app_guard.system_dirs.clone();
     let active_input = app_guard.active_input_dir.clone();
     let active_output = app_guard.active_output_dir.clone();
     let on_submit = app_guard.on_submit_script.clone();
@@ -69,6 +79,7 @@ async fn main() -> Result<()> {
     let on_output_clone = on_output.clone();
     let input_dirs_clone = input_dirs.clone();
     let output_dirs_clone = output_dirs.clone();
+    let system_dirs_clone = system_dirs.clone();
     let active_input_clone = active_input.clone();
     let active_output_clone = active_output.clone();
 
@@ -119,6 +130,7 @@ async fn main() -> Result<()> {
                     active_output_dir: active_output_clone.clone(),
                     input_dirs: input_dirs_clone.clone(),
                     output_dirs: output_dirs_clone.clone(),
+                    system_dirs: system_dirs_clone.clone(),
                     timestamp: Local::now(),
                     user_message: None,
                     agent_response: None,
@@ -137,6 +149,7 @@ async fn main() -> Result<()> {
             active_output_dir: active_output.clone(),
             input_dirs: input_dirs.clone(),
             output_dirs: output_dirs.clone(),
+            system_dirs: system_dirs.clone(),
             timestamp: Local::now(),
             user_message: None,
             agent_response: None,

@@ -41,7 +41,9 @@ pub struct ScriptletContext {
     pub active_output_dir: Option<PathBuf>,
     pub input_dirs: Vec<PathBuf>,
     pub output_dirs: Vec<PathBuf>,
-    pub timestamp: DateTime<Local>,
+    pub system_dirs: Vec<PathBuf>,
+    #[allow(dead_code)]
+    pub timestamp: chrono::DateTime<Local>,
     pub user_message: Option<String>,
     pub agent_response: Option<String>,
 }

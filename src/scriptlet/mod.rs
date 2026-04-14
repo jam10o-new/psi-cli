@@ -38,6 +38,15 @@ impl ScriptletRunner {
                 .collect::<Vec<_>>()
                 .join(":"),
         );
+        cmd.env(
+            "SYSTEM_DIRS",
+            context
+                .system_dirs
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join(":"),
+        );
 
         if let Some(ref input_file) = context.latest_input_file {
             cmd.env("LATEST_INPUT_FILE", input_file.to_string_lossy().to_string());

@@ -249,6 +249,20 @@ pub enum AppMode {
         completions: Vec<PathBuf>,
         completion_index: usize,
     },
+    /// Add input directory: type path to add to input_dirs
+    AddInputDir {
+        buffer: String,
+        cursor: usize,
+        completions: Vec<PathBuf>,
+        completion_index: usize,
+    },
+    /// Add output directory: type path to add to output_dirs
+    AddOutputDir {
+        buffer: String,
+        cursor: usize,
+        completions: Vec<PathBuf>,
+        completion_index: usize,
+    },
 }
 
 pub struct App {
@@ -436,6 +450,8 @@ impl App {
             AppMode::Select { .. } => self.handle_key_select(key),
             AppMode::EditFile { .. } => self.handle_key_edit(key),
             AppMode::Import { .. } => self.handle_key_import(key),
+            AppMode::AddInputDir { .. } => self.handle_key_add_dir(key, true),
+            AppMode::AddOutputDir { .. } => self.handle_key_add_dir(key, false),
         }
     }
 
@@ -502,6 +518,26 @@ impl App {
                     completion_index: 0,
                 };
                 self.status_message = None;
+            }
+            KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::ALT) => {
+                // Alt+I: add input directory
+                self.mode = AppMode::AddInputDir {
+                    buffer: String::new(),
+                    cursor: 0,
+                    completions: Vec::new(),
+                    completion_index: 0,
+                };
+                self.status_message = Some("Add input directory (Enter: add | Tab: cycle | Esc cancel)".into());
+            }
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::ALT) => {
+                // Alt+O: add output directory
+                self.mode = AppMode::AddOutputDir {
+                    buffer: String::new(),
+                    cursor: 0,
+                    completions: Vec::new(),
+                    completion_index: 0,
+                };
+                self.status_message = Some("Add output directory (Enter: add | Tab: cycle | Esc cancel)".into());
             }
             KeyCode::Tab => {
                 // Tab: enter select mode
@@ -605,6 +641,32 @@ impl App {
                     *ci = (*ci + 10).min(max);
                 }
             }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Ctrl+D: delete selected file
+                if let AppMode::Select { cursor_index } = &self.mode {
+                    if let Some(msg) = self.messages.get(*cursor_index) {
+                        if msg.filepath == PathBuf::from("user-input") {
+                            self.status_message = Some("Cannot delete: message was typed inline (no file)".into());
+                            return InputAction::None;
+                        }
+                        if !msg.filepath.exists() {
+                            self.status_message = Some("Cannot delete: file does not exist on disk".into());
+                            return InputAction::None;
+                        }
+                        let path = msg.filepath.clone();
+                        self.messages.remove(*cursor_index);
+                        self.recalculate_line_offsets();
+                        if let Err(e) = fs::remove_file(&path) {
+                            self.status_message = Some(format!("Delete failed: {}", e));
+                        } else {
+                            self.status_message = Some(format!("Deleted: {:?}", path));
+                        }
+                        if let AppMode::Select { cursor_index: ci } = &mut self.mode {
+                            *ci = (*ci).min(self.messages.len().saturating_sub(1));
+                        }
+                    }
+                }
+            }
             KeyCode::Enter => {
                 // Open the selected message for editing if it has a real file path
                 if let AppMode::Select { cursor_index } = &self.mode {
@@ -659,17 +721,22 @@ impl App {
                         if let AppMode::EditFile { dirty, .. } = &mut self.mode {
                             *dirty = false;
                         }
-                        return InputAction::Saved { path: target_path };
                     }
                 } else {
                     self.status_message = Some("Original file no longer exists on disk".into());
                 }
+                // Restore edit status message so it's not lost
+                if let AppMode::EditFile { target_path: tp, dirty } = &self.mode {
+                    let marker = if *dirty { " [*]" } else { "" };
+                    self.status_message = Some(
+                        format!("Editing: {:?}{} | Ctrl+S save | Enter:save+exit | Esc cancel", tp, marker),
+                    );
+                }
             }
             KeyCode::Esc => {
-                // Esc: cancel edit, return to select mode
-                let idx = self.messages.len().saturating_sub(1);
-                self.mode = AppMode::Select { cursor_index: idx };
-                self.status_message = Some("Edit cancelled".into());
+                // Esc: cancel edit, return to normal mode
+                self.mode = AppMode::Normal;
+                self.status_message = None;
                 return InputAction::None;
             }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -716,8 +783,8 @@ impl App {
                 return InputAction::None;
             }
         }
-        let idx = self.messages.len().saturating_sub(1);
-        self.mode = AppMode::Select { cursor_index: idx };
+        self.mode = AppMode::Normal;
+        self.status_message = None;
         InputAction::Saved { path: target_path }
     }
 
@@ -810,6 +877,141 @@ impl App {
                     *cursor = new_cur;
                     *completions = new_completions;
                     *completion_index = 0;
+                }
+            }
+            _ => {}
+        }
+        InputAction::None
+    }
+
+    /// Generic handler for "add directory" modes (AddInputDir / AddOutputDir)
+    fn handle_key_add_dir(&mut self, key: event::KeyEvent, is_input: bool) -> InputAction {
+        let (buf, cur, comps, ci) = if is_input {
+            match &self.mode {
+                AppMode::AddInputDir { buffer, cursor, completions, completion_index } => {
+                    (buffer.clone(), *cursor, completions.clone(), *completion_index)
+                }
+                _ => return InputAction::None,
+            }
+        } else {
+            match &self.mode {
+                AppMode::AddOutputDir { buffer, cursor, completions, completion_index } => {
+                    (buffer.clone(), *cursor, completions.clone(), *completion_index)
+                }
+                _ => return InputAction::None,
+            }
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = AppMode::Normal;
+                self.status_message = None;
+            }
+            KeyCode::Enter => {
+                // Add the selected/completed directory
+                let target = if !comps.is_empty() {
+                    comps.get(ci).or_else(|| comps.first())
+                } else {
+                    Some(&PathBuf::from(buf.as_str()))
+                };
+
+                if let Some(dir_path) = target {
+                    if dir_path.is_dir() {
+                        if is_input {
+                            if let AppMode::AddInputDir { .. } = &mut self.mode {
+                                if !self.input_dirs.contains(dir_path) {
+                                    self.input_dirs.push(dir_path.clone());
+                                    self.active_input_dir = Some(dir_path.clone());
+                                    self.status_message = Some(format!("Added input: {:?}", dir_path));
+                                } else {
+                                    self.status_message = Some("Already in input dirs".into());
+                                }
+                            }
+                        } else {
+                            if let AppMode::AddOutputDir { .. } = &mut self.mode {
+                                if !self.output_dirs.contains(dir_path) {
+                                    self.output_dirs.push(dir_path.clone());
+                                    self.active_output_dir = Some(dir_path.clone());
+                                    self.status_message = Some(format!("Added output: {:?}", dir_path));
+                                } else {
+                                    self.status_message = Some("Already in output dirs".into());
+                                }
+                            }
+                        }
+                    } else {
+                        self.status_message = Some("Not a directory".into());
+                    }
+                }
+                self.mode = AppMode::Normal;
+            }
+            KeyCode::Tab => {
+                if !comps.is_empty() {
+                    let next = (ci + 1) % comps.len();
+                    let new_path = comps[next].to_string_lossy().to_string();
+                    let new_len = new_path.len();
+                    if is_input {
+                        if let AppMode::AddInputDir { buffer, completion_index, cursor, .. } = &mut self.mode {
+                            *buffer = new_path;
+                            *completion_index = next;
+                            *cursor = new_len;
+                        }
+                    } else {
+                        if let AppMode::AddOutputDir { buffer, completion_index, cursor, .. } = &mut self.mode {
+                            *buffer = new_path;
+                            *completion_index = next;
+                            *cursor = new_len;
+                        }
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                if cur > 0 {
+                    let new_buf = {
+                        let mut b = buf.clone();
+                        b.remove(cur - 1);
+                        b
+                    };
+                    let new_cur = cur - 1;
+                    let new_completions = self.compute_path_completions(&new_buf);
+                    if is_input {
+                        if let AppMode::AddInputDir { buffer, cursor, completions, completion_index } = &mut self.mode {
+                            *buffer = new_buf;
+                            *cursor = new_cur;
+                            *completions = new_completions;
+                            *completion_index = 0;
+                        }
+                    } else {
+                        if let AppMode::AddOutputDir { buffer, cursor, completions, completion_index } = &mut self.mode {
+                            *buffer = new_buf;
+                            *cursor = new_cur;
+                            *completions = new_completions;
+                            *completion_index = 0;
+                        }
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                let new_buf = {
+                    let mut b = buf.clone();
+                    b.insert(cur, c);
+                    b
+                };
+                let new_cur = cur + 1;
+                let new_completions = self.compute_path_completions(&new_buf);
+                if is_input {
+                    if let AppMode::AddInputDir { buffer, cursor, completions, completion_index } = &mut self.mode {
+                        *buffer = new_buf;
+                        *cursor = new_cur;
+                        *completions = new_completions;
+                        *completion_index = 0;
+                    }
+                } else {
+                    if let AppMode::AddOutputDir { buffer, cursor, completions, completion_index } = &mut self.mode {
+                        *buffer = new_buf;
+                        *cursor = new_cur;
+                        *completions = new_completions;
+                        *completion_index = 0;
+                    }
                 }
             }
             _ => {}
@@ -922,6 +1124,8 @@ pub fn ui(f: &mut ratatui::Frame, app: &mut App) {
     match &app.mode {
         AppMode::Normal | AppMode::Select { .. } | AppMode::EditFile { .. } => render_input(f, chunks[1], app),
         AppMode::Import { .. } => render_import(f, chunks[1], app),
+        AppMode::AddInputDir { .. } => render_add_dir(f, chunks[1], app, true),
+        AppMode::AddOutputDir { .. } => render_add_dir(f, chunks[1], app, false),
     }
 }
 
@@ -1088,6 +1292,10 @@ fn render_input(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
                 Span::styled("Ctrl+R:rotate in  ", Style::default().fg(Color::DarkGray)),
                 Span::styled("Ctrl+O:rotate out", Style::default().fg(Color::DarkGray)),
             ]),
+            Line::from(vec![
+                Span::styled("Alt+I:add input  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Alt+O:add output", Style::default().fg(Color::DarkGray)),
+            ]),
         ]
     };
     let instruction_count = instruction_lines.len() as u16;
@@ -1214,6 +1422,72 @@ fn render_import(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     }
 }
 
+fn render_add_dir(f: &mut ratatui::Frame, area: Rect, app: &mut App, is_input: bool) {
+    let (buffer, cursor, completions, completion_index) = if is_input {
+        match &app.mode {
+            AppMode::AddInputDir { buffer, cursor, completions, completion_index } => {
+                (buffer, *cursor, completions, *completion_index)
+            }
+            _ => return,
+        }
+    } else {
+        match &app.mode {
+            AppMode::AddOutputDir { buffer, cursor, completions, completion_index } => {
+                (buffer, *cursor, completions, *completion_index)
+            }
+            _ => return,
+        }
+    };
+
+    let title = if is_input {
+        "Add input directory (Enter: add | Tab: cycle | Esc: cancel)"
+    } else {
+        "Add output directory (Enter: add | Tab: cycle | Esc: cancel)"
+    };
+
+    let input = Paragraph::new(buffer.as_str())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title),
+        )
+        .style(Style::default().fg(Color::Yellow));
+
+    f.render_widget(input, area);
+
+    let cursor_x = area.x + 1 + cursor as u16;
+    let cursor_y = area.y + 1;
+    f.set_cursor_position((cursor_x.min(area.right() - 2), cursor_y));
+
+    // Show completions
+    if !completions.is_empty() {
+        let max_w = area.width as usize;
+        let comp_lines: Vec<Line> = completions.iter().enumerate().map(|(i, p)| {
+            let path_str = p.to_string_lossy().to_string();
+            let truncated = if path_str.len() > max_w {
+                format!("...{}", &path_str[path_str.len().saturating_sub(max_w - 3)..])
+            } else {
+                path_str
+            };
+
+            if i == completion_index {
+                Line::from(Span::styled(
+                    format!("▶ {}", truncated),
+                    SELECTED_HIGHLIGHT,
+                ))
+            } else {
+                Line::from(Span::raw(truncated))
+            }
+        }).take(5).collect();
+
+        let comp_block = Paragraph::new(comp_lines)
+            .block(Block::default().borders(Borders::TOP).title("Completions"))
+            .style(Style::default().fg(Color::DarkGray));
+
+        f.render_widget(comp_block, area);
+    }
+}
+
 pub async fn run_tui(
     app: Arc<Mutex<App>>,
     on_submit_script: Option<PathBuf>,
@@ -1235,6 +1509,12 @@ pub async fn run_tui(
     )?;
     crossterm::terminal::enable_raw_mode()?;
 
+    // Snapshot system_dirs from app
+    let system_dirs = {
+        let app_guard = app.lock().await;
+        app_guard.system_dirs.clone()
+    };
+
     // Main loop
     let result = run_main_loop(
         &mut terminal,
@@ -1242,6 +1522,7 @@ pub async fn run_tui(
         on_submit_script,
         input_dirs,
         output_dirs,
+        system_dirs,
         active_input_dir,
         active_output_dir,
     )
@@ -1265,6 +1546,7 @@ async fn run_main_loop(
     on_submit_script: Option<PathBuf>,
     input_dirs: Vec<PathBuf>,
     output_dirs: Vec<PathBuf>,
+    system_dirs: Vec<PathBuf>,
     active_input_dir: Option<PathBuf>,
     active_output_dir: Option<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -1295,15 +1577,20 @@ async fn run_main_loop(
                         // Dispatch submit scriptlet
                         if let InputAction::Submit { message, input_file } = action {
                             if let Some(ref script) = on_submit_script {
-                                // Release the lock before calling scriptlet
+                                // Snapshot latest output for full context
+                                let latest_output = app_guard.messages.iter()
+                                    .rev()
+                                    .find(|m| matches!(m.role, MessageRole::Output))
+                                    .map(|m| m.filepath.clone());
                                 drop(app_guard);
                                 let context = ScriptletContext {
                                     latest_input_file: input_file.clone(),
-                                    latest_output_file: None,
+                                    latest_output_file: latest_output,
                                     active_input_dir: active_input_dir.clone(),
                                     active_output_dir: active_output_dir.clone(),
                                     input_dirs: input_dirs.clone(),
                                     output_dirs: output_dirs.clone(),
+                                    system_dirs: system_dirs.clone(),
                                     timestamp: Local::now(),
                                     user_message: Some(message),
                                     agent_response: None,
