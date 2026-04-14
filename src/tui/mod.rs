@@ -126,6 +126,34 @@ fn wrapped_line_count(text: &str, max_inner_width: u16) -> usize {
     count.max(1)
 }
 
+/// Wrap text into display lines at the given max width (display-cell aware).
+fn wrap_text(text: &str, max_width: u16) -> Vec<String> {
+    if max_width == 0 || text.is_empty() {
+        return vec![text.to_string()];
+    }
+    let max_w = max_width as usize;
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0;
+
+    for ch in text.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_width + w > max_w && !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+            current_width = w;
+        }
+        current.push(ch);
+        current_width += w;
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 /// Build a list of byte offsets where each display line starts.
 /// Returns [0, line2_start_byte, line3_start_byte, ...]
 fn wrapped_line_starts(text: &str, max_inner_width: u16) -> Vec<usize> {
@@ -1236,72 +1264,37 @@ fn render_input(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let inner_width = area.width.saturating_sub(2); // 2 for borders
 
     let is_edit = matches!(app.mode, AppMode::EditFile { .. });
+    let is_select = matches!(app.mode, AppMode::Select { .. });
 
-    // Build instruction lines — edit mode gets save/exit shortcuts
-    let instruction_lines = if is_edit {
+    // Build instructions as flat text, then wrap them
+    let (title_label, shortcuts_text) = if is_edit {
         let edit_info = if let AppMode::EditFile { target_path, dirty } = &app.mode {
             let marker = if *dirty { " [*]" } else { "" };
-            Some(format!("Editing: {:?}{}", target_path, marker))
+            format!(" — Editing: {:?}{}", target_path, marker)
         } else {
-            None
+            String::new()
         };
-        vec![
-            Line::from(vec![
-                Span::styled("Edit", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::styled(
-                    edit_info.map(|s| format!(" — {}", s)).unwrap_or_default(),
-                    Style::default().fg(Color::Yellow),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("Enter:save+exit  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("Ctrl+S:save  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("Ctrl+J:nl", Style::default().fg(Color::DarkGray)),
-            ]),
-            Line::from(vec![
-                Span::styled("Esc:cancel  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("PgUp/PgDn:scroll", Style::default().fg(Color::DarkGray)),
-            ]),
-        ]
+        (
+            format!("Edit{}", edit_info),
+            "Enter: save+exit  ·  Ctrl+S: save  ·  Ctrl+J: newline  ·  Esc: cancel  ·  PgUp/PgDn: scroll  ·  ↑/↓/←/→: cursor nav".to_string(),
+        )
+    } else if is_select {
+        (
+            "SELECT".to_string(),
+            "↑/↓ or j/k: navigate  ·  Enter: edit  ·  Ctrl+D: delete  ·  PgUp/PgDn: jump  ·  Esc: back to input  ·  Type to search".to_string(),
+        )
     } else {
-        let mode_label = match app.mode {
-            AppMode::Select { .. } => "SELECT ",
-            _ => "",
-        };
-        vec![
-            Line::from(vec![
-                Span::styled(
-                    format!("{}Input", mode_label),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("Tab:select  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("Ctrl+F:import  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("Ctrl+J:nl", Style::default().fg(Color::DarkGray)),
-            ]),
-            Line::from(vec![
-                Span::styled("Enter:submit  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("PgUp/PgDn:scroll", Style::default().fg(Color::DarkGray)),
-            ]),
-            Line::from(vec![
-                Span::styled("Ctrl+↑/↓:history  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("End:scroll bottom", Style::default().fg(Color::DarkGray)),
-            ]),
-            Line::from(vec![
-                Span::styled("Ctrl+R:rotate in  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("Ctrl+O:rotate out", Style::default().fg(Color::DarkGray)),
-            ]),
-            Line::from(vec![
-                Span::styled("Alt+I:add input  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("Alt+O:add output", Style::default().fg(Color::DarkGray)),
-            ]),
-        ]
+        (
+            "Input".to_string(),
+            "Enter: submit  ·  Ctrl+J: newline  ·  Tab: select  ·  Ctrl+F: import  ·  PgUp/PgDn: scroll chat  ·  End: bottom  ·  Ctrl+↑/↓: history  ·  ↑/↓: cursor nav  ·  Ctrl+R/O: rotate dirs  ·  Alt+I/O: add dirs".to_string(),
+        )
     };
-    let instruction_count = instruction_lines.len() as u16;
 
-    // In edit mode, always show the status line with the edit info
-    // In normal mode, show transient status (e.g. "Active input: ...", "Saved: ...")
+    // Calculate how many lines the shortcuts text will wrap to
+    let shortcut_lines = wrap_text(&shortcuts_text, inner_width.max(1));
+    let instruction_count = (1 + shortcut_lines.len()) as u16;
+
+    // In edit/select mode, always show the status line; in normal mode, transient status
     let status_para = if let Some(ref msg) = app.status_message {
         Some(Paragraph::new(Line::from(Span::styled(
             format!(" {}", msg),
@@ -1325,9 +1318,27 @@ fn render_input(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         })
         .split(area);
 
-    // Render instruction header
-    let instructions = Paragraph::new(instruction_lines)
-        .style(Style::default().fg(Color::DarkGray));
+    // Build title + wrapped shortcuts as a single Paragraph
+    let title_color = if is_edit {
+        Color::Yellow
+    } else if is_select {
+        Color::White
+    } else {
+        Color::Cyan
+    };
+
+    let mut all_lines = vec![Line::from(Span::styled(
+        &title_label,
+        Style::default().fg(title_color).add_modifier(Modifier::BOLD),
+    ))];
+    for wrapped_line in &shortcut_lines {
+        all_lines.push(Line::from(Span::styled(
+            wrapped_line.clone(),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let instructions = Paragraph::new(all_lines);
     f.render_widget(instructions, input_chunks[0]);
 
     // Render status message if present
