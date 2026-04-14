@@ -377,6 +377,7 @@ impl App {
                 filepath: entry.path,
                 created_at: entry.created_at,
                 filename,
+                is_file: entry.metadata.is_file,
             });
         }
 
@@ -461,6 +462,7 @@ impl App {
                 filepath: written_path.clone().unwrap_or_else(|| PathBuf::from("user-input")),
                 created_at: Local::now(),
                 filename: format!("input-{}.txt", timestamp_ms),
+                is_file: written_path.is_some(),
             });
             self.recalculate_line_offsets();
 
@@ -548,7 +550,7 @@ impl App {
                 self.status_message = None;
             }
             KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::ALT) => {
-                // Alt+I: add input directory
+                // Alt+I: add input directory (also available in select mode via Ctrl+R)
                 self.mode = AppMode::AddInputDir {
                     buffer: String::new(),
                     cursor: 0,
@@ -558,7 +560,7 @@ impl App {
                 self.status_message = Some("Add input directory (Enter: add | Tab: cycle | Esc cancel)".into());
             }
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::ALT) => {
-                // Alt+O: add output directory
+                // Alt+O: add output directory (also available in select mode via Ctrl+O)
                 self.mode = AppMode::AddOutputDir {
                     buffer: String::new(),
                     cursor: 0,
@@ -668,6 +670,26 @@ impl App {
                     let max = self.messages.len().saturating_sub(1);
                     *ci = (*ci + 10).min(max);
                 }
+            }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Ctrl+R: add input directory
+                self.mode = AppMode::AddInputDir {
+                    buffer: String::new(),
+                    cursor: 0,
+                    completions: Vec::new(),
+                    completion_index: 0,
+                };
+                self.status_message = Some("Add input directory (Enter: add | Tab: cycle | Esc cancel)".into());
+            }
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Ctrl+O: add output directory
+                self.mode = AppMode::AddOutputDir {
+                    buffer: String::new(),
+                    cursor: 0,
+                    completions: Vec::new(),
+                    completion_index: 0,
+                };
+                self.status_message = Some("Add output directory (Enter: add | Tab: cycle | Esc cancel)".into());
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Ctrl+D: delete selected file
@@ -1196,8 +1218,20 @@ fn render_chat_log(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         let header_style = if is_selected { SELECTED_HIGHLIGHT } else { header_style };
         let role_prefix = if is_selected { "▶ " } else { "" };
 
-        // Header
+        // Header with filename and file type
         let timestamp = msg.created_at.format("%H:%M:%S");
+        let type_badge = if msg.is_file {
+            let ext = msg.filepath.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
+            if ext.is_empty() {
+                "file".to_string()
+            } else {
+                format!(".{}", ext)
+            }
+        } else {
+            "inline".to_string()
+        };
+        let file_info = format!(" {} ({})", msg.filename, type_badge);
+
         lines.push(Line::from(vec![
             Span::styled(
                 format!("╔══ {}[{}] ", role_prefix, role_label),
@@ -1207,7 +1241,11 @@ fn render_chat_log(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
                 format!("{}", timestamp),
                 Style::default().fg(Color::DarkGray),
             ),
-            Span::styled(" ══", header_style),
+            Span::styled(" ══ ", header_style),
+            Span::styled(
+                file_info,
+                Style::default().fg(Color::DarkGray),
+            ),
         ]));
 
         // Content (word wrap)
@@ -1281,7 +1319,7 @@ fn render_input(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     } else if is_select {
         (
             "SELECT".to_string(),
-            "↑/↓ or j/k: navigate  ·  Enter: edit  ·  Ctrl+D: delete  ·  PgUp/PgDn: jump  ·  Esc: back to input  ·  Type to search".to_string(),
+            "↑/↓ or j/k: navigate  ·  Enter: edit  ·  Ctrl+D: delete  ·  Ctrl+R: add input dir  ·  Ctrl+O: add output dir  ·  PgUp/PgDn: jump  ·  Esc: back  ·  Type to search".to_string(),
         )
     } else {
         (

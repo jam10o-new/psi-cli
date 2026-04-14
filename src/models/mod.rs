@@ -15,6 +15,8 @@ pub struct ChatMessage {
     pub filepath: PathBuf,
     pub created_at: DateTime<Local>,
     pub filename: String,
+    /// Whether the source was a regular file (vs a virtual/synthetic message)
+    pub is_file: bool,
 }
 
 #[derive(Debug, Clone)]
