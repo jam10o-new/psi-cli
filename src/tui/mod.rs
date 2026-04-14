@@ -19,6 +19,8 @@ use tokio::sync::Mutex;
 pub enum InputAction {
     /// User submitted a message; file was auto-written to input_file
     Submit { message: String, input_file: Option<PathBuf> },
+    /// User saved an edit in-place (no scriptlet dispatch)
+    Saved { path: PathBuf },
     /// No action
     None,
 }
@@ -235,12 +237,9 @@ pub enum AppMode {
     Select {
         cursor_index: usize,
     },
-    /// Edit mode: editing a selected file's content in-place
+    /// Edit mode: editing a selected file's content in-place using the shared input box
     EditFile {
         target_path: PathBuf,
-        buffer: String,
-        cursor: usize,
-        scroll_offset: u16,
         dirty: bool,
     },
     /// Import mode: typing a file path to copy into active input dir
@@ -622,16 +621,15 @@ impl App {
 
                         // Always re-read fresh from disk when entering edit mode
                         if let Ok(content) = fs::read_to_string(&msg.filepath) {
-                            let content_len = content.len();
+                            // Populate the shared input box with file content
+                            self.input_text = content;
+                            self.input_cursor = self.input_text.len();
                             self.mode = AppMode::EditFile {
                                 target_path: msg.filepath.clone(),
-                                buffer: content,
-                                cursor: content_len,
-                                scroll_offset: 0,
                                 dirty: false,
                             };
                             self.status_message = Some(
-                                format!("Editing: {:?} | Ctrl+S save | Esc cancel", msg.filepath),
+                                format!("Editing: {:?} | Ctrl+S save | Ctrl+Enter save+exit | Esc cancel", msg.filepath),
                             );
                         } else {
                             self.status_message = Some(
@@ -648,91 +646,79 @@ impl App {
     }
 
     fn handle_key_edit(&mut self, key: event::KeyEvent) -> InputAction {
-        let AppMode::EditFile { cursor, .. } = self.mode else { return InputAction::None };
+        let AppMode::EditFile { target_path, dirty: _ } = &self.mode else { return InputAction::None };
 
         match key.code {
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Save to original file path
-                if let AppMode::EditFile { target_path, buffer, dirty, .. } = &mut self.mode {
-                    if target_path.exists() {
-                        let path = target_path.clone();
-                        if let Err(e) = fs::write(&path, buffer) {
-                            self.status_message = Some(format!("Save failed: {}", e));
-                        } else {
-                            *dirty = false;
-                            self.status_message = Some(format!("Saved: {:?}", path));
-                        }
+                // Ctrl+S: save to original file path, stay in edit mode
+                let target_path = target_path.clone();
+                if target_path.exists() {
+                    if let Err(e) = fs::write(&target_path, &self.input_text) {
+                        self.status_message = Some(format!("Save failed: {}", e));
                     } else {
-                        self.status_message = Some("Original file no longer exists on disk".into());
+                        if let AppMode::EditFile { dirty, .. } = &mut self.mode {
+                            *dirty = false;
+                        }
+                        return InputAction::Saved { path: target_path };
                     }
+                } else {
+                    self.status_message = Some("Original file no longer exists on disk".into());
                 }
             }
             KeyCode::Esc => {
-                self.mode = AppMode::Normal;
-                self.status_message = None;
+                // Esc: cancel edit, return to select mode
+                let idx = self.messages.len().saturating_sub(1);
+                self.mode = AppMode::Select { cursor_index: idx };
+                self.status_message = Some("Edit cancelled".into());
+                return InputAction::None;
             }
-            KeyCode::Backspace => {
-                if cursor > 0 {
-                    if let AppMode::EditFile { buffer, cursor, dirty, .. } = &mut self.mode {
-                        let c = *cursor;
-                        buffer.remove(c - 1);
-                        *cursor = c - 1;
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Ctrl+Enter: save and exit (same as plain Enter in edit mode)
+                return self.handle_edit_save_and_exit();
+            }
+            KeyCode::Enter => {
+                // Enter: save and exit back to select mode
+                return self.handle_edit_save_and_exit();
+            }
+            _ => {
+                // Delegate all other keys to the normal handler
+                // (typing, cursor nav, Ctrl+J newline, etc.)
+                let len_before = self.input_text.len();
+                self.handle_key_normal(key);
+                // Mark dirty if the normal handler modified input
+                if self.input_text.len() != len_before {
+                    if let AppMode::EditFile { dirty, .. } = &mut self.mode {
                         *dirty = true;
                     }
                 }
-            }
-            KeyCode::Delete => {
-                if let AppMode::EditFile { buffer, cursor, dirty, .. } = &mut self.mode {
-                    if *cursor < buffer.len() {
-                        buffer.remove(*cursor);
-                        *dirty = true;
-                    }
+                // Restore edit status after normal handler may have cleared it
+                if let AppMode::EditFile { target_path: tp, dirty } = &self.mode {
+                    let marker = if *dirty { " [*]" } else { "" };
+                    self.status_message = Some(
+                        format!("Editing: {:?}{} | Ctrl+S save | Enter:save+exit | Esc cancel", tp, marker),
+                    );
                 }
+                return InputAction::None;
             }
-            KeyCode::Left => {
-                if let AppMode::EditFile { cursor, .. } = &mut self.mode {
-                    if *cursor > 0 {
-                        *cursor -= 1;
-                    }
-                }
-            }
-            KeyCode::Right => {
-                if let AppMode::EditFile { buffer, cursor, .. } = &mut self.mode {
-                    if *cursor < buffer.len() {
-                        *cursor += 1;
-                    }
-                }
-            }
-            KeyCode::Up => {
-                if let AppMode::EditFile { scroll_offset, .. } = &mut self.mode {
-                    *scroll_offset = scroll_offset.saturating_sub(1);
-                }
-            }
-            KeyCode::Down => {
-                if let AppMode::EditFile { scroll_offset, .. } = &mut self.mode {
-                    *scroll_offset += 1;
-                }
-            }
-            KeyCode::PageUp => {
-                if let AppMode::EditFile { scroll_offset, .. } = &mut self.mode {
-                    *scroll_offset = scroll_offset.saturating_sub(10);
-                }
-            }
-            KeyCode::PageDown => {
-                if let AppMode::EditFile { scroll_offset, .. } = &mut self.mode {
-                    *scroll_offset += 10;
-                }
-            }
-            KeyCode::Char(c) => {
-                if let AppMode::EditFile { buffer, cursor, dirty, .. } = &mut self.mode {
-                    buffer.insert(*cursor, c);
-                    *cursor += 1;
-                    *dirty = true;
-                }
-            }
-            _ => {}
         }
         InputAction::None
+    }
+
+    /// Common save-and-exit logic for edit mode (called by Enter / Ctrl+Enter).
+    fn handle_edit_save_and_exit(&mut self) -> InputAction {
+        let AppMode::EditFile { target_path, .. } = &self.mode else {
+            return InputAction::None;
+        };
+        let target_path = target_path.clone();
+        if target_path.exists() {
+            if let Err(e) = fs::write(&target_path, &self.input_text) {
+                self.status_message = Some(format!("Save failed: {}", e));
+                return InputAction::None;
+            }
+        }
+        let idx = self.messages.len().saturating_sub(1);
+        self.mode = AppMode::Select { cursor_index: idx };
+        InputAction::Saved { path: target_path }
     }
 
     fn handle_key_import(&mut self, key: event::KeyEvent) -> InputAction {
@@ -932,10 +918,9 @@ pub fn ui(f: &mut ratatui::Frame, app: &mut App) {
     // Chat log area
     render_chat_log(f, chunks[0], app);
 
-    // Input area
+    // Input area (Normal, Select, and EditFile all share the same input box)
     match &app.mode {
-        AppMode::Normal | AppMode::Select { .. } => render_input(f, chunks[1], app),
-        AppMode::EditFile { .. } => render_edit_file(f, chunks[1], app),
+        AppMode::Normal | AppMode::Select { .. } | AppMode::EditFile { .. } => render_input(f, chunks[1], app),
         AppMode::Import { .. } => render_import(f, chunks[1], app),
     }
 }
@@ -1046,39 +1031,69 @@ fn render_chat_log(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
 fn render_input(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let inner_width = area.width.saturating_sub(2); // 2 for borders
 
-    // Build the instruction lines
-    let mode_label = match app.mode {
-        AppMode::Select { .. } => "SELECT ",
-        _ => "",
+    let is_edit = matches!(app.mode, AppMode::EditFile { .. });
+
+    // Build instruction lines — edit mode gets save/exit shortcuts
+    let instruction_lines = if is_edit {
+        let edit_info = if let AppMode::EditFile { target_path, dirty } = &app.mode {
+            let marker = if *dirty { " [*]" } else { "" };
+            Some(format!("Editing: {:?}{}", target_path, marker))
+        } else {
+            None
+        };
+        vec![
+            Line::from(vec![
+                Span::styled("Edit", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    edit_info.map(|s| format!(" — {}", s)).unwrap_or_default(),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Enter:save+exit  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Ctrl+S:save  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Ctrl+J:nl", Style::default().fg(Color::DarkGray)),
+            ]),
+            Line::from(vec![
+                Span::styled("Esc:cancel  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("PgUp/PgDn:scroll", Style::default().fg(Color::DarkGray)),
+            ]),
+        ]
+    } else {
+        let mode_label = match app.mode {
+            AppMode::Select { .. } => "SELECT ",
+            _ => "",
+        };
+        vec![
+            Line::from(vec![
+                Span::styled(
+                    format!("{}Input", mode_label),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Tab:select  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Ctrl+F:import  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Ctrl+J:nl", Style::default().fg(Color::DarkGray)),
+            ]),
+            Line::from(vec![
+                Span::styled("Enter:submit  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("PgUp/PgDn:scroll", Style::default().fg(Color::DarkGray)),
+            ]),
+            Line::from(vec![
+                Span::styled("Ctrl+↑/↓:history  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("End:scroll bottom", Style::default().fg(Color::DarkGray)),
+            ]),
+            Line::from(vec![
+                Span::styled("Ctrl+R:rotate in  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Ctrl+O:rotate out", Style::default().fg(Color::DarkGray)),
+            ]),
+        ]
     };
-    let instruction_lines = vec![
-        Line::from(vec![
-            Span::styled(
-                format!("{}Input", mode_label),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Tab:select  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Ctrl+F:import  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Ctrl+J:nl", Style::default().fg(Color::DarkGray)),
-        ]),
-        Line::from(vec![
-            Span::styled("Ctrl+Enter:submit  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("PgUp/PgDn:scroll", Style::default().fg(Color::DarkGray)),
-        ]),
-        Line::from(vec![
-            Span::styled("Ctrl+↑/↓:history  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("End:scroll bottom", Style::default().fg(Color::DarkGray)),
-        ]),
-        Line::from(vec![
-            Span::styled("Ctrl+R:rotate in  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Ctrl+O:rotate out", Style::default().fg(Color::DarkGray)),
-        ]),
-    ];
     let instruction_count = instruction_lines.len() as u16;
 
-    // Determine status line
+    // In edit mode, always show the status line with the edit info
+    // In normal mode, show transient status (e.g. "Active input: ...", "Saved: ...")
     let status_para = if let Some(ref msg) = app.status_message {
         Some(Paragraph::new(Line::from(Span::styled(
             format!(" {}", msg),
@@ -1102,7 +1117,7 @@ fn render_input(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         })
         .split(area);
 
-    // Render instruction header (no border, just text)
+    // Render instruction header
     let instructions = Paragraph::new(instruction_lines)
         .style(Style::default().fg(Color::DarkGray));
     f.render_widget(instructions, input_chunks[0]);
@@ -1139,8 +1154,8 @@ fn render_input(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
 
     f.render_widget(input_box, input_chunks[input_box_idx]);
 
-    // Calculate cursor position
-    if matches!(app.mode, AppMode::Normal) {
+    // Cursor position (show cursor in Normal and EditFile modes)
+    if matches!(app.mode, AppMode::Normal | AppMode::EditFile { .. }) {
         let (cursor_display_line, cursor_col) = wrapped_cursor(&app.input_text, app.input_cursor, inner_width);
         let cursor_x = input_chunks[input_box_idx].x + 1 + cursor_col as u16;
         let cursor_y = input_chunks[input_box_idx].y + 1 + cursor_display_line as u16;
@@ -1148,42 +1163,6 @@ fn render_input(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         let clamped_x = cursor_x.min(input_chunks[input_box_idx].right().saturating_sub(1));
         let clamped_y = cursor_y.min(input_chunks[input_box_idx].bottom().saturating_sub(1));
         f.set_cursor_position((clamped_x, clamped_y));
-    }
-}
-
-fn render_edit_file(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
-    let AppMode::EditFile { target_path, buffer, cursor, scroll_offset, dirty } = &app.mode else { return };
-
-    let title = if *dirty {
-        format!("Edit: {:?} [*]", target_path)
-    } else {
-        format!("Edit: {:?}", target_path)
-    };
-
-    let edit_text = Paragraph::new(buffer.as_str())
-        .scroll((*scroll_offset, 0))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title),
-        )
-        .style(Style::default().fg(Color::White));
-
-    f.render_widget(edit_text, area);
-
-    // Calculate cursor position
-    let visible_height = area.height.saturating_sub(2);
-    let cursor_line = buffer[..*cursor].matches('\n').count() as u16;
-    let cursor_col = {
-        let since_last_newline = buffer.rsplitn(*cursor + 1, |c| c == '\n').next().unwrap_or("").len();
-        since_last_newline as u16
-    };
-
-    if cursor_line >= *scroll_offset && cursor_line < *scroll_offset + visible_height {
-        f.set_cursor_position((
-            area.x + 1 + cursor_col.min(area.width.saturating_sub(2)),
-            area.y + 1 + (cursor_line - *scroll_offset),
-        ));
     }
 }
 
