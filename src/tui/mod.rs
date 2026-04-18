@@ -304,6 +304,7 @@ pub struct App {
     pub chat_area_height: u16,
     /// Cached inner width of the input area (excluding borders), used for wrapped cursor nav
     pub input_inner_width: u16,
+    pub input_scroll: u16,
     pub active_input_dir: Option<PathBuf>,
     pub active_output_dir: Option<PathBuf>,
     pub input_dirs: Vec<PathBuf>,
@@ -332,6 +333,7 @@ impl App {
             scroll_to_bottom: false,
             chat_area_height: 0,
             input_inner_width: 80,
+            input_scroll: 0,
             active_input_dir: None,
             active_output_dir: None,
             input_dirs: Vec::new(),
@@ -468,6 +470,7 @@ impl App {
 
             self.input_text.clear();
             self.input_cursor = 0;
+            self.input_scroll = 0;
             Some((submitted, written_path))
         } else {
             None
@@ -529,6 +532,7 @@ impl App {
                     self.history_index = -1;
                     self.input_text.clear();
                     self.input_cursor = 0;
+                    self.input_scroll = 0;
                 }
             }
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1400,25 +1404,38 @@ fn render_input(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         Paragraph::new(input_text)
     };
 
+    let input_box_area = input_chunks[input_box_idx];
+    let input_inner_height = input_box_area.height.saturating_sub(2);
+
+    // Calculate cursor display position to handle scrolling
+    let (cursor_display_line, cursor_col) = wrapped_cursor(&app.input_text, app.input_cursor, inner_width);
+    
+    // Adjust scroll to keep cursor in view
+    if cursor_display_line < app.input_scroll as usize {
+        app.input_scroll = cursor_display_line as u16;
+    } else if cursor_display_line >= (app.input_scroll + input_inner_height) as usize {
+        app.input_scroll = (cursor_display_line as u16).saturating_sub(input_inner_height).saturating_add(1);
+    }
+
     let input_box = input_para
         .style(Style::default().fg(Color::White))
         .wrap(Wrap { trim: false })
+        .scroll((app.input_scroll, 0))
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(ratatui::widgets::BorderType::Rounded),
         );
 
-    f.render_widget(input_box, input_chunks[input_box_idx]);
+    f.render_widget(input_box, input_box_area);
 
     // Cursor position (show cursor in Normal and EditFile modes)
     if matches!(app.mode, AppMode::Normal | AppMode::EditFile { .. }) {
-        let (cursor_display_line, cursor_col) = wrapped_cursor(&app.input_text, app.input_cursor, inner_width);
-        let cursor_x = input_chunks[input_box_idx].x + 1 + cursor_col as u16;
-        let cursor_y = input_chunks[input_box_idx].y + 1 + cursor_display_line as u16;
+        let cursor_x = input_box_area.x + 1 + cursor_col as u16;
+        let cursor_y = input_box_area.y + 1 + (cursor_display_line as u16).saturating_sub(app.input_scroll);
 
-        let clamped_x = cursor_x.min(input_chunks[input_box_idx].right().saturating_sub(1));
-        let clamped_y = cursor_y.min(input_chunks[input_box_idx].bottom().saturating_sub(1));
+        let clamped_x = cursor_x.min(input_box_area.right().saturating_sub(1));
+        let clamped_y = cursor_y.min(input_box_area.bottom().saturating_sub(1));
         f.set_cursor_position((clamped_x, clamped_y));
     }
 }
